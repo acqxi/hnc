@@ -1,0 +1,14 @@
+## patient data
+*.xlsx
+*.dcm
+
+## python tmp file
+
+*.pyc
+
+## tmp program file
+untitled*
+*checkpoint*
+*checkpoint*/
+
+test*.ipynb
