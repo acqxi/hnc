@@ -2,8 +2,11 @@
 *.xlsx
 *.dcm
 
-## python tmp file
+## laps data
+*.npy
+*.txt
 
+## python tmp file
 *.pyc
 
 ## tmp program file
