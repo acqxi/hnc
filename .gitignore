@@ -5,6 +5,7 @@
 ## laps data
 *.npy
 *.txt
+split_sets.json
 
 ## python tmp file
 *.pyc
@@ -17,5 +18,6 @@ untitled*
 *checkpoint*
 *checkpoint*/
 exp/
+testflow/
 
 test*.ipynb

@@ -20,6 +20,9 @@ from torchvision import datasets, transforms
 from tqdm import notebook, tqdm
 
 
+with open('./split_sets.json', 'r') as f:
+    SPLITS = json.load(f)
+
 def run_once(model, X: List[torch.Tensor], y: List[int], loss_function, optimizer, isTrain=False):
     model.train(isTrain)  # Set model to training mode
     optimizer.zero_grad()  # zero the parameter gradients
@@ -164,3 +167,88 @@ def train_loop(
     writer.close()
 
     return model
+
+
+def train_flow_valid_test(
+    device,
+    model: str,
+    mParam: Union[List[int], int],
+    mode: str = "LNM",
+    dType: str = "preserved",
+    isBalanced: bool = True,
+    loss: str = "BCE",
+    opti: str = "adam",
+    ex: int = 5,
+    split: int = 0,
+    batch: int = 16,
+    lr: float = 1e-3,
+    earlyStop: int = 20,
+    exps: int = 3,
+    isNB: bool = True,
+    expName: str = "",
+    prefixDir: str = "",
+    isTrain=True,
+):
+    """
+    model   :str      =>['rn'|'du'|'durn']
+    mParam  :list|int =>[[10|18|34]]
+    mode    :str      =>['ENE'|'LNM']
+    dType   :str      =>['scaled'|'preserved'|'both']
+    isBal   :bool     =>[True|False]
+    loss    :str      =>['BCE'|'CE']
+    opti    :str      =>['adam']
+    ex      :int      =>[0|5]
+    split   :int      =>(0 => 39)
+    batch   :int      =>(2 => 32)
+    lr      :float    =>(5e-4 => 1e-2)
+    earlySt :int      =>(10 => ??)
+    exps    :int      =>(1 => 10)
+    isNB    :bool     =>[True|False]
+    expName :str      =>''
+    isTrain :bool     =>[True|False]
+    """
+    if isTrain:
+        dataPath = f"./data/laps/ex{ex}/size-{'scaled' if dType != 'preserved' else 'preserved'}"
+
+        dataset = LAPsDatasetNode(
+            dataRoot=dataPath,
+            isSplit=False,
+            balanced=isBalanced,
+            mode=mode,
+            xfmr=xfmr.Compose(
+                [xfmr.RandomHorizontalFlip(), xfmr.RandomRotation(180, fill=-160), xfmr.Normalize([0.5], [0.5])]
+            ),
+        )
+        dataset.load_split_node(valid=SPLITS[split]["valid"], test=SPLITS[split]["test"])
+        dataset.show_split_info()
+        for exp in range(exps):
+            path = os.path.join(
+                prefixDir,
+                f"{model}{mParam}_{mode}",
+                f"{dType}_ex{ex}_split{split:02}",
+                f"b{batch}_lr{lr}_es{earlyStop}_exp{exp}{f'_({expName})' if expName else ''}/",
+            )
+
+            if model == "rn":
+                net = generate_ResNet(model_depth=mParam, n_input_channels=1, n_classes=1)
+            elif model == "du":
+                net = DLNN(features=1)
+            elif model == "durn":
+                net = DualResNet(boxResNet=mParam[0], smlResNet=mParam[1], features=1, in_ch=1, ratio=3, base=3)
+            net.to(device)
+
+            dataset.which_in_set(filePath=os.path.join(path, "test.log"))
+
+            if loss == "BCE":
+                loss_func = nn.BCEWithLogitsLoss()
+            elif loss == "CE":
+                loss_func = nn.CrossEntropyLoss()
+
+            if opti == "adam":
+                optimizer = torch.optim.Adam(net.parameters(), lr=lr)  # Using Karpathy's learning rate constant
+
+            t_dl = DataLoader(dataset.set_phase("trains"), batch_size=batch, num_workers=8)
+            v_dl = DataLoader(dataset.set_phase("valids"), batch_size=64, num_workers=8)
+            s_dl = DataLoader(dataset.set_phase("tests"), batch_size=96, num_workers=8)
+
+            net = train_loop(net, 500, t_dl, v_dl, s_dl, loss_func, optimizer, path, device, earlyStop, isNB)

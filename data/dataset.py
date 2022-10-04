@@ -109,6 +109,7 @@ class LAPsDatasetNode:
         balanced: bool = True,
         isShuffle: bool = True,
         xfmr: Optional[xfmr.Compose] = None,
+        isSplit:bool=True,
     ):
         self.root = dataRoot
         self.mode = mode
@@ -123,11 +124,12 @@ class LAPsDatasetNode:
 
         print(f"read data folder : {dataRoot}")
         print(f"load {len(self.paths)} Lymph Node images")
+        
+        if isSplit:
+            self.split_dataset(self.ratio)
+            self.show_split_info()
 
-        self.split_dataset(self.ratio)
-        self.show_split_info()
-
-        self.which_in_set()
+            self.which_in_set()
 
     @property
     def copy(self):
@@ -185,7 +187,7 @@ class LAPsDatasetNode:
             else:
                 which = "trains"
 
-            if p.endswith(f"{0}.npy"):
+            if not p.endswith(f"{0}.npy"):
                 self.sets["ENE"][which].append(p)
             self.sets["LNM"][which].append(p)
             for i in range(3):
