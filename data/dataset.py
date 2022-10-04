@@ -252,3 +252,67 @@ class LAPsDatasetNode:
             img: torch.Tensor = self.xfmr(torch.from_numpy(img).float())
         return img.float().contiguous(), label, path
 
+
+class LAPsDatasetNodes(LAPsDatasetNode):
+    def __init__(
+        self,
+        scaledDataRoot="./data/laps/ex5/size-scaled",
+        mode: str = ["LNM", "ENE"][0],
+        splitRatio: List[int] = [7, 1, 2],
+        balanced: bool = True,
+        isShuffle: bool = True,
+        xfmr: Optional[xfmr.Compose] = None,
+    ):
+        super().__init__(scaledDataRoot, mode, splitRatio, balanced, isShuffle, xfmr)
+        print(f"read data folder : {scaledDataRoot.replace('size-scaled','size-preserved')}")
+
+    def _copy_split_to_preserved(self):
+        self.sets2 = {}
+        self.raw_sets2 = [{}, {}, {}]
+        for mode in self.sets:
+            self.sets2[mode] = {}
+            for phase in self.sets[mode]:
+                self.sets2[mode][phase] = []
+                for p_or_ps in self.sets[mode][phase]:
+                    self.sets2[mode][phase].append(p_or_ps.replace("size-scaled", "size-preserved"))
+                for i in range(3):
+                    self.raw_sets2[i][phase] = [p for p in self.sets2["LNM"][phase] if p.endswith(f"{i}.npy")]
+        tmp = self.raw_sets2
+        self.gets2 = {
+            "LNM": {
+                k: [LAPsGetter(ps) for ps in [tmp[0][k], tmp[1][k] + tmp[2][k], tmp[0][k] + tmp[1][k] + tmp[2][k]]]
+                for k in tmp[0]
+            },  # 0, 1, all
+            "ENE": {k: [LAPsGetter(ps) for ps in [tmp[1][k], tmp[2][k], tmp[1][k] + tmp[2][k]]] for k in tmp[0]},
+        }
+
+    def set_loader(self):
+        super().set_loader()
+        self._copy_split_to_preserved()
+
+    def __getitem__(self, idx):
+        if self.phase is None:
+            raise ValueError("have to set phase before use")
+
+        if self.balanced:
+            img, path = self.gets[self.mode][self.phase][idx % 2].get()
+            img2, _ = self.gets2[self.mode][self.phase][idx % 2].get()
+            label = idx % 2
+        else:
+            img, path = self.gets[self.mode][self.phase][2].get()
+            img2, _ = self.gets2[self.mode][self.phase][2].get()
+            label = int(re.findall(r"(\d)\.", path)[0])
+            if self.mode == "LNM" and label == 2:
+                label = 1
+            elif self.mode == "ENE":
+                label -= 1
+        img = np.expand_dims(img, axis=0)
+        img2 = np.expand_dims(img2, axis=0)
+        if self.xfmr is not None:
+            img: torch.Tensor = self.xfmr(torch.from_numpy(img).float())
+            img2: torch.Tensor = self.xfmr(torch.from_numpy(img2).float())
+        else:
+            img: torch.Tensor = torch.from_numpy(img).float()
+            img2: torch.Tensor = torch.from_numpy(img2).float()
+            
+        return img.float().contiguous(), img2.float().contiguous(), label, path
