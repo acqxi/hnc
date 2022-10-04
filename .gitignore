@@ -9,9 +9,13 @@
 ## python tmp file
 *.pyc
 
+## pytorch weights
+*.pth
+
 ## tmp program file
 untitled*
 *checkpoint*
 *checkpoint*/
+exp/
 
 test*.ipynb

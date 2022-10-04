@@ -1,3 +1,4 @@
+import copy
 import glob
 import os
 import random as rd
@@ -99,7 +100,7 @@ def show_info(dataset, anno: Optional[str] = None) -> None:
     print(f"{len(tmps):^9}")
 
 
-class LAPsDatasetNode(Dataset):
+class LAPsDatasetNode:
     def __init__(
         self,
         dataRoot="./data/laps/ex5/size-preserved",
@@ -109,7 +110,6 @@ class LAPsDatasetNode(Dataset):
         isShuffle: bool = True,
         xfmr: Optional[xfmr.Compose] = None,
     ):
-        super().__init__()
         self.root = dataRoot
         self.mode = mode
         self.ratio = splitRatio
@@ -119,6 +119,7 @@ class LAPsDatasetNode(Dataset):
         self.phase = None
 
         self.paths = [p for p in glob.glob(os.path.join(dataRoot, "*.npy"))]
+        self.get_name = {'lap':lambda p : os.path.basename(p), 'patient': lambda p:re.findall(r"(\d{3})_20", p)[0]}
 
         print(f"read data folder : {dataRoot}")
         print(f"load {len(self.paths)} Lymph Node images")
@@ -127,6 +128,10 @@ class LAPsDatasetNode(Dataset):
         self.show_split_info()
 
         self.which_in_set()
+
+    @property
+    def copy(self):
+        return copy.copy(self)
 
     def split_dataset(self, ratio):
         print(f"train:valid:test = {':'.join(map(str, ratio))}")
@@ -147,56 +152,53 @@ class LAPsDatasetNode(Dataset):
         for k in self.sets.keys():
             show_info(self.sets[k], anno=k + "sets")
             print()
-
-    def who_in_set(self, mode=1):
+            
+    def _in_set(self, mode:str=['lap', 'patient'][0], filePath: Optional[str] = None):
         for k in ["valids", "tests"]:
-            tmp_names = set([re.findall(r"(\d{3})_20", p)[0] for p in self.sets["LNM"][k]])
-            print(f"patients in set {k:6}", ":", ", ".join(sorted(list(tmp_names), key=int)))
+            tmp_names = set([self.get_name[mode](p) for p in self.sets["LNM"][k]])
+            if filePath:
+                os.makedirs(os.path.dirname(filePath), exist_ok=True)
+                with open(filePath, "a") as f:
+                    f.writelines((f"LAPs in set {k:6}", ":", ", ".join(sorted(list(tmp_names)))))
+                    f.writelines("\n\n\n")
+            else:
+                print(f"{mode.upper()}s in set {k:6}", ":", ", ".join(sorted(list(tmp_names))))
 
-    def which_in_set(self, mode=1):
-        for k in ["valids", "tests"]:
-            tmp_names = set([os.path.basename(p) for p in self.sets["LNM"][k]])
-            print(f"patients in set {k:6}", ":", ", ".join(sorted(list(tmp_names), key=hash)))
+    def who_in_set(self, mode=1, filePath: Optional[str] = None):
+        self._in_set('patient', filePath)
+
+    def which_in_set(self, mode=1, filePath: Optional[str] = None):
+        self._in_set('lap', filePath)
+                
+    def _load_split(self, valid: str, test: str, mode:str=['lap', 'patient'][0]):
+        valids = valid.split(", ")
+        tests = test.split(", ")
+        self.sets = {"LNM": {"trains": [], "valids": [], "tests": []}, "ENE": {"trains": [], "valids": [], "tests": []}}
+        self.raw_sets = [{"trains": [], "valids": [], "tests": []} for i in range(3)]
+        for p in self.paths:
+            name = self.get_name[mode](p)
+                    
+            if name in valids:
+                which = "valids"
+            elif name in tests:
+                which = "tests"
+            else:
+                which = "trains"
+
+            if p.endswith(f"{0}.npy"):
+                self.sets["ENE"][which].append(p)
+            self.sets["LNM"][which].append(p)
+            for i in range(3):
+                if p.endswith(f"{i}.npy"):
+                    self.raw_sets[i][which].append(p)
+        self.set_loader()
+        
 
     def load_split_patient(self, valid: str, test: str):
-        valids = valid.split(", ")
-        tests = test.split(", ")
-        self.sets = {"LNM": {"trains": [], "valids": [], "tests": []}, "ENE": {"trains": [], "valids": [], "tests": []}}
-
-        for p in self.paths:
-            which = ""
-            patien = re.findall(r"(\d{3})_20", p)[0]
-            if patien in valids:
-                which = "valids"
-            elif patien in tests:
-                which = "tests"
-            else:
-                which = "trains"
-
-            if not p.endswith(f"{0}.npy"):
-                self.sets["ENE"][which].append(p)
-            self.sets["LNM"][which].append(p)
-        self.set_loader()
+        self._load_split(valid, test, 'patient')
 
     def load_split_node(self, valid: str, test: str):
-        valids = valid.split(", ")
-        tests = test.split(", ")
-        self.sets = {"LNM": {"trains": [], "valids": [], "tests": []}, "ENE": {"trains": [], "valids": [], "tests": []}}
-
-        for p in self.paths:
-            which = ""
-            file_name = os.path.basename(p)
-            if file_name in valids:
-                which = "valids"
-            elif file_name in tests:
-                which = "tests"
-            else:
-                which = "trains"
-
-            if not p.endswith(f"{0}.npy"):
-                self.sets["ENE"][which].append(p)
-            self.sets["LNM"][which].append(p)
-        self.set_loader()
+        self._load_split(valid, test, 'lap')
 
     def set_loader(self):
         tmp = self.raw_sets
@@ -219,12 +221,12 @@ class LAPsDatasetNode(Dataset):
 
     def set_phase(self, phase):
         self.phase = phase
-        return self
+        return self.copy
 
     def set_mode(self, mode):
         self.mode = mode
         self.show_split_info(mode)
-        return self
+        return self.copy
 
     def __len__(self):
         if self.phase is None:
@@ -245,9 +247,8 @@ class LAPsDatasetNode(Dataset):
                 label = 1
             elif self.mode == "ENE":
                 label -= 1
+        img = np.expand_dims(img, axis=0)
         if self.xfmr is not None:
             img: torch.Tensor = self.xfmr(torch.from_numpy(img).float())
         return img.float().contiguous(), label, path
-
-
 
