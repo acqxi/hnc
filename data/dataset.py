@@ -264,8 +264,9 @@ class LAPsDatasetNodes(LAPsDatasetNode):
         balanced: bool = True,
         isShuffle: bool = True,
         xfmr: Optional[xfmr.Compose] = None,
+        isSplit:bool=True,
     ):
-        super().__init__(scaledDataRoot, mode, splitRatio, balanced, isShuffle, xfmr)
+        super().__init__(scaledDataRoot, mode, splitRatio, balanced, isShuffle, xfmr, isSplit)
         print(f"read data folder : {scaledDataRoot.replace('size-scaled','size-preserved')}")
 
     def _copy_split_to_preserved(self):
@@ -311,10 +312,10 @@ class LAPsDatasetNodes(LAPsDatasetNode):
         img = np.expand_dims(img, axis=0)
         img2 = np.expand_dims(img2, axis=0)
         if self.xfmr is not None:
-            img: torch.Tensor = self.xfmr(torch.from_numpy(img).float())
-            img2: torch.Tensor = self.xfmr(torch.from_numpy(img2).float())
+            scaled: torch.Tensor = self.xfmr(torch.from_numpy(img).float())
+            preserved: torch.Tensor = self.xfmr(torch.from_numpy(img2).float())
         else:
-            img: torch.Tensor = torch.from_numpy(img).float()
-            img2: torch.Tensor = torch.from_numpy(img2).float()
+            scaled: torch.Tensor = torch.from_numpy(img).float()
+            preserved: torch.Tensor = torch.from_numpy(img2).float()
             
-        return img.float().contiguous(), img2.float().contiguous(), label, path
+        return preserved.float().contiguous(), scaled.float().contiguous(), label, path

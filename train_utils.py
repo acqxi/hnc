@@ -10,7 +10,8 @@ import torch
 import torch.nn as nn
 import torchvision
 import torchvision.transforms as xfmr
-from data.dataset import LAPsDatasetNode
+from data.dataset import LAPsDatasetNode, LAPsDatasetNodes
+from model.dualnet import DualNN
 from model.resnet import DualResNet, generate_ResNet
 from sklearn.metrics import accuracy_score, auc, confusion_matrix, f1_score, precision_score, recall_score, roc_curve
 from torch.utils.data import DataLoader, Dataset
@@ -188,6 +189,7 @@ def train_flow_valid_test(
     expName: str = "",
     prefixDir: str = "",
     isTrain=True,
+    debug=False,
 ):
     """
     model   :str      =>['rn'|'du'|'durn']
@@ -209,16 +211,26 @@ def train_flow_valid_test(
     """
     if isTrain:
         dataPath = f"./data/laps/ex{ex}/size-{'scaled' if dType != 'preserved' else 'preserved'}"
-
-        dataset = LAPsDatasetNode(
-            dataRoot=dataPath,
-            isSplit=False,
-            balanced=isBalanced,
-            mode=mode,
-            xfmr=xfmr.Compose(
-                [xfmr.RandomHorizontalFlip(), xfmr.RandomRotation(180, fill=-160), xfmr.Normalize([0.5], [0.5])]
-            ),
-        )
+        if dType == 'both':
+            dataset = LAPsDatasetNodes(
+                scaledDataRoot=dataPath,
+                isSplit=False,
+                balanced=isBalanced,
+                mode=mode,
+                xfmr=xfmr.Compose(
+                    [xfmr.RandomHorizontalFlip(), xfmr.RandomRotation(180, fill=-160), xfmr.Normalize([0.5], [0.5])]
+                ),
+            )
+        elif dType == 'scaled' or dType == 'preserved':
+            dataset = LAPsDatasetNode(
+                dataRoot=dataPath,
+                isSplit=False,
+                balanced=isBalanced,
+                mode=mode,
+                xfmr=xfmr.Compose(
+                    [xfmr.RandomHorizontalFlip(), xfmr.RandomRotation(180, fill=-160), xfmr.Normalize([0.5], [0.5])]
+                ),
+            )
         dataset.load_split_node(valid=SPLITS[split]["valid"], test=SPLITS[split]["test"])
         dataset.show_split_info()
         for exp in range(exps):
@@ -232,7 +244,7 @@ def train_flow_valid_test(
             if model == "rn":
                 net = generate_ResNet(model_depth=mParam, n_input_channels=1, n_classes=1)
             elif model == "du":
-                net = DLNN(features=1)
+                net = DualNN(features=1)
             elif model == "durn":
                 net = DualResNet(boxResNet=mParam[0], smlResNet=mParam[1], features=1, in_ch=1, ratio=3, base=3)
             net.to(device)
@@ -250,5 +262,8 @@ def train_flow_valid_test(
             t_dl = DataLoader(dataset.set_phase("trains"), batch_size=batch, num_workers=8)
             v_dl = DataLoader(dataset.set_phase("valids"), batch_size=64, num_workers=8)
             s_dl = DataLoader(dataset.set_phase("tests"), batch_size=96, num_workers=8)
+            
+            if debug:
+                print(', '.join(map(lambda x : f"{x.shape}", next(iter(t_dl))[:-2])))
 
             net = train_loop(net, 500, t_dl, v_dl, s_dl, loss_func, optimizer, path, device, earlyStop, isNB)
