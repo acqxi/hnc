@@ -266,4 +266,4 @@ def train_flow_valid_test(
             if debug:
                 print(', '.join(map(lambda x : f"{x.shape}", next(iter(t_dl))[:-2])))
 
-            net = train_loop(net, 500, t_dl, v_dl, s_dl, loss_func, optimizer, path, device, earlyStop, isNB)
+            train_loop(net, 500, t_dl, v_dl, s_dl, loss_func, optimizer, path, device, earlyStop, isNB)
