@@ -1,270 +1,173 @@
-import glob
-import os
-import re
-from typing import Dict, List, Optional, Tuple, Union
+from pathlib import Path
+from typing import Union
 
+import cv2
 import matplotlib.pyplot as plt
 import numpy as np
-import PIL
-import pyclipper
 import pydicom
-import skimage.transform as sk_xfmr
-from data.utils import ExcelDataLoader
-from einops import rearrange
-from PIL import Image, ImageDraw
 
-from .utils import ExcelDataLoader
+from data.utils import equidistantZoomContour, readCT, conv_mm2px, show_debug_img
 
 
-def get_slice(ctPath: str, show: bool = False):
-    ct = pydicom.dcmread(ctPath)
-    img_ary = ct.pixel_array
-    r_img_ary: np.ndarray = img_ary * ct.RescaleSlope + ct.RescaleIntercept
-    if show:
-        plt.imshow(r_img_ary, cmap=plt.cm.bone)
-        plt.show()
-    return {
-        "slice": ct.SliceLocation,
-        "loc": ct.InstanceNumber,
-        "spacing": ct.PixelSpacing,
-        "position": ct.ImagePositionPatient,
-        "orientation": ct.ImageOrientationPatient,
-        "ctpx": r_img_ary,
-    }
+def crop3D(lapDict:dict, save_path:Union[str, Path], fileName:str='testFile', debug:bool=False):
+    """
+    > It takes a dictionary of slices, finds the largest bounding box that contains all the slices,
+    crops all the slices to that bounding box, and then returns a 3D array of the cropped slices
+    
+    Args:
+      lapDict (dict): the dictionary of the processed lap
+      save_path (Union[str, Path]): The path to save the cropped 3D image.
+      fileName (str): the name of the file to be saved. Defaults to testFile
+      debug (bool): if True, will show the first 16 slices of the cropped 3D image. Defaults to False
+    """
+    # 3D crop all masked slices fit the contour
+    # 1. find the max bbox
+    mbbox = [999, 999, 0, 0]  # max bbox : x, y, w, h
+    for loc, data in lapDict.items():
+        bbox = data["bbox"]
+        mbbox[0] = min(mbbox[0], bbox[0])
+        mbbox[1] = min(mbbox[1], bbox[1])
+        mbbox[2] = max(mbbox[2], bbox[0] + bbox[2])
+        mbbox[3] = max(mbbox[3], bbox[1] + bbox[3])
+    mbbox[2] -= mbbox[0]
+    mbbox[3] -= mbbox[1]
+    # print(f"max bbox: {mbbox}")
+
+    # 2. make all slices mask apply
+    for loc, data in lapDict.items():
+        lapDict[loc]["masked_ctpx"] = data["ctpx"] * data["mask_ext"]
+
+    # 3. crop all slices
+    for loc, data in lapDict.items():
+        data["croped_ctpx"] = data["masked_ctpx"][mbbox[1]:mbbox[1] + mbbox[3], mbbox[0]:mbbox[0] + mbbox[2]]
+
+    # 4. make 3D image
+    crop_3D = np.zeros((len(lapDict), mbbox[3], mbbox[2]), np.int16)
+    min_loc = min(lapDict.keys())
+
+    for loc, data in lapDict.items():
+        crop_3D[loc - min_loc, :, :] = data["croped_ctpx"]
+        if debug and loc - min_loc < 16:
+            if loc - min_loc == 0:
+                plt.figure(figsize=(10, 10))
+            print(
+                np.min(data["croped_ctpx"] * data["slope"] + data["intercept"]),
+                np.max(data["croped_ctpx"] * data["slope"] + data["intercept"]),
+            )
+            plt.subplot(4, 4, loc - min_loc + 1)
+            plt.imshow((data["croped_ctpx"] * data["slope"] + data["intercept"]).clip(-100, 155))
+            plt.title(f"loc: {loc}")
+
+    # lap["crop3D"] = crop_3D
+        
+    # 5. save the processed 3D image
+    if save_path:
+        if isinstance(save_path, str):
+            save_path = Path(save_path)
+        save_path.mkdir(parents=True, exist_ok=True)
+
+        np.save(save_path / f"{fileName}.npy", crop_3D)
+
+    return crop_3D
 
 
-def equidistant_zoom_contour(contour: np.ndarray, margin):
-    pco = pyclipper.PyclipperOffset()
-    pco.MiterLimit = 2
-    contour = contour[:, 0, :]
-    pco.AddPath(contour, pyclipper.JT_MITER, pyclipper.ET_CLOSEDPOLYGON)
-    solution = pco.Execute(margin)
-    solution = np.array(solution).reshape(-1, 1, 2).astype(int)
-    return solution
+def getCropMaskLAP(rtss_path: Path, extend_size: int = 0, save_path: Path = None, pass_tumor: bool = True, debug: bool = False):
+    """
+    It reads the contour data from the RTSTRUCT file,
+    and then uses the contour data to create a mask for each slice in the CT scan.
 
+    The mask is then used to crop the CT scan to the area of interest.
+    The cropped CT scan is then saved as a 3D numpy array.
+    The function returns a dictionary of the 3D numpy arrays.
+    The dictionary keys are the names of the contours.
+    The dictionary values are the 3D numpy arrays.
+    The 3D numpy arrays are of shape (number of slices, height, width).
+    The height and width are the height and width of the bounding box of the contour.
+    The bounding box is the smallest rectangle that contains the contour.
+    The bounding box is calculated for each slice, and then the largest bounding box is used for all slices.
 
-def convert_mm_to_pixel(di_ipp, di_iop, di_ps, contourData):
-    # fmt: off
-    matrix_im = np.array([ 
-        [ di_iop[0] * di_ps[0], di_iop[3] * di_ps[1], np.finfo(np.float16).tiny, di_ipp[0] ],
-        [ di_iop[1] * di_ps[0], di_iop[4] * di_ps[1], np.finfo(np.float16).tiny, di_ipp[1] ],
-        [ di_iop[2] * di_ps[0], di_iop[5] * di_ps[1], np.finfo(np.float16).tiny, di_ipp[2] ],
-        [ 0                   , 0                   , 0                        , 1         ],
-    ]) 
-    # fmt: on
-    inv_matrix_im = np.linalg.inv(matrix_im)
-    contour_px = []
+    Args:
+      rtss_path (Path): Path, the path to the rtss file
+      extend_size (int): the number of pixels to extend the contour by. Defaults to 0
+      save_path (Path): The path to save the numpy array of the 3D image.
+      pass_tumor (bool): If True, then the tumor contour will be ignored. Defaults to True
+      debug (bool): If True, it will show the contour and the mask. Defaults to False
+    """
+    rtss = pydicom.dcmread(rtss_path)
+    cts, laps, loc2id = {}, {}, {}  # type: ignore
+    cis = rtss.ReferencedFrameOfReferenceSequence[0].RTReferencedStudySequence[0]
+    cis = cis.RTReferencedSeriesSequence[0].ContourImageSequence
+    for ci in cis:
+        ct_id = ci.ReferencedSOPInstanceUID
+        if ct_id not in cts:
+            ct_stem = f"CT.{ct_id}.dcm"
+            cts[ct_id] = readCT(rtss_path.parent / ct_stem)
+        loc2id[cts[ct_id]["loc"]] = ct_id
 
-    for index, v in enumerate([contourData[i : i + 3] for i in range(0, len(contourData), 3)]):
-        v.append(1)
-        i, j, trash, trash = [int(np.around(i)) for i in inv_matrix_im.dot(np.array(v))]
-        contour_px.append((i, j))
-
-    return contour_px
-
-
-def coutours_img(px, shape, mode: int = 0):
-    if isinstance(px, np.ndarray):
-        px = px.tolist()
-    if not isinstance(px, tuple):
-        px = [(x, y) for x, y in px]
-    img = Image.new("L", shape[::-1], 0)
-    if mode == 0:
-        ImageDraw.Draw(img).polygon(px, outline=1, fill=1)
-    elif mode == 1:
-        ImageDraw.Draw(img).polygon(px, outline=1, fill=2)
-        ImageDraw.Draw(img).line(px, fill=1, width=6)
-    return img
-
-
-def slice_lap_mask(
-    ctDict: Dict[str, any],
-    tumorPointAryMM: np.ndarray,
-    exten: int = 5,
-    debug: bool = False,
-):
-    mask_poly = np.array(
-        convert_mm_to_pixel(ctDict["position"], ctDict["orientation"], ctDict["spacing"], tumorPointAryMM)
-    )
-    mask_img = coutours_img(mask_poly, ctDict["ctpx"].shape)
-
-    if exten > 0:
-        mask_poly_ori = mask_poly.copy()
-        mask_img_ori = np.array(mask_img)
-
-        mask_poly = rearrange(np.array(mask_poly), "b (c l) -> b c l", c=1)
-        mask_poly = equidistant_zoom_contour(mask_poly, exten)
-        mask_poly = rearrange(mask_poly, "b c l -> b (c l)")
-        mask_poly = np.append(mask_poly, mask_poly[0, None], axis=0)
-        mask_img = coutours_img(mask_poly, ctDict["ctpx"].shape)
-
-    if debug:
-        plt.figure(figsize=(10, 10))
-        debug_img = np.concatenate(
-            [
-                np.expand_dims(mask_img, axis=2),
-                np.zeros((512, 512, 1)) if exten == 0 else np.expand_dims(mask_img_ori, axis=2),
-                np.zeros((512, 512, 1)),
-            ],
-            axis=2,
-        )
-        plt.imshow(debug_img)
-        plt.show()
-
-    lapDict = {
-        "maskpx": np.array(mask_img),
-        "maskpoly": mask_poly,
-        "loc": ctDict["loc"],
-        "px": ctDict["ctpx"].copy(),
-    }
-
-    return lapDict
-
-
-def get_laps_from_dcm(RTSSpath: str, debug: bool = False, exten: int = 5, skipTumor: bool = True):
-    folder = os.path.dirname(RTSSpath)
-    RTSS = pydicom.dcmread(RTSSpath)
-    ct_full_list = [
-        cts.ReferencedSOPInstanceUID
-        for cts in RTSS.ReferencedFrameOfReferenceSequence[0]
-        .RTReferencedStudySequence[0]
-        .RTReferencedSeriesSequence[0]
-        .ContourImageSequence
-    ][::-1]
-    laps = {}
-    cts = {}
-    for i in range(len(RTSS.StructureSetROISequence)):
-        contour_name = RTSS.StructureSetROISequence[i].ROIName
-        if skipTumor and "Tumor" in contour_name:
+    for i in range(len(rtss.StructureSetROISequence)):
+        contour_name = rtss.StructureSetROISequence[i].ROIName
+        if contour_name in laps:
+            print(f"Detect duplicate contour name: {contour_name}")
+            continue
+        if pass_tumor and "Tumor" in contour_name:
             continue
         if contour_name != "BODY":
-            # print(len(dicom_ds.ROIContourSequence),i)
-            if contour_name in laps:
-                raise IndexError(f"{contour_name} exist")
-            lap = laps[contour_name] = []
-            for idx, cSeq in enumerate(RTSS.ROIContourSequence[i].ContourSequence):
-                ct_id = cSeq.ContourImageSequence[0].ReferencedSOPInstanceUID
+            lap = laps[contour_name] = {"cts_masks": {}}
+            for seq in rtss.ROIContourSequence[i].ContourSequence:
+                ct_id = seq.ContourImageSequence[0].ReferencedSOPInstanceUID
                 if ct_id not in cts:
-                    cts[ct_id] = get_slice(os.path.join(folder, f"CT.{ct_id}.dcm"), show=False)
-                ctDict = cts[ct_id]
-                lap.append(slice_lap_mask(ctDict, cSeq.ContourData, exten=exten, debug=False))
-                # print(ctDict["loc"], ct_id, len(poly))
-            # fmt: off
-            if exten != 0:
-                lap.insert(0, lap[0] | {
-                    "px": get_slice( os.path.join(folder,f"CT.{ct_full_list[lap[0]['loc']]}.dcm"), show=False)["ctpx"]
-                })
-                lap.append(lap[-1] | {
-                    "px": get_slice(os.path.join(folder, f"CT.{ct_full_list[lap[-1]['loc']-1]}.dcm"), show=False)["ctpx"]
-                })
-            # fmt: on
-            if debug:
-                print(contour_name)
-                w, h = [(i // 2, (i + 1) // 2) for i in range(12) if (i // 2) * ((i + 1) // 2) >= len(lap)][0]
-                plt.figure(figsize=(h * 3, w * 3))
-                for idx, lp in enumerate(lap):
-                    plt.subplot(w, h, idx + 1)
-                    plt.imshow(lp["px"].clip(-160, 120), cmap=plt.cm.bone)
-                    plt.plot(lp["maskpoly"][:, 0], lp["maskpoly"][:, 1], color="r")
-                    plt.title(f"polyline:{lp['maskpoly'].shape}")
-                plt.show()
+                    ct_stem = f"CT.{ct_id}.dcm"
+                    cts[ct_id] = readCT(rtss_path.parent / ct_stem)
+                data = cts[ct_id]
+
+                contour_points_mm = seq.ContourData
+                contour_points_px = conv_mm2px(
+                    data["position"],
+                    data["orientation"],
+                    data["spacing"],
+                    contour_points_mm,
+                )
+
+                contour_points_px = np.array(contour_points_px)
+                extend_contour_point = equidistantZoomContour(contour_points_px, extend_size)
+                extend_contour_point = np.append(extend_contour_point, extend_contour_point[0:1], axis=0)
+
+                mask_img = cv2.fillConvexPoly(np.zeros(data["ctpx"].shape, np.uint8), contour_points_px, 1)
+                mask_img_extend = cv2.fillConvexPoly(np.zeros(data["ctpx"].shape, np.uint8), extend_contour_point, 1)
+
+                lap["cts_masks"][data["loc"]] = {
+                    "mask_ext": mask_img_extend,
+                    "bbox": cv2.boundingRect(extend_contour_point),  # x, y, w, h
+                    **data,
+                }
+
+                if debug:
+                    show_debug_img(lap, data, contour_points_px, extend_contour_point, mask_img, mask_img_extend, rtss_path.parent.name, contour_name)
+
+            if extend_size > 0:
+                upper, lower = (
+                    max(lap["cts_masks"].keys()) + 1,
+                    min(lap["cts_masks"].keys()) - 1,
+                )
+                if upper <= len(cis):
+                    lap["cts_masks"][upper] = {
+                        "mask_ext": lap["cts_masks"][upper - 1]["mask_ext"],
+                        "bbox": lap["cts_masks"][upper - 1]["bbox"],
+                        **cts[loc2id[upper]],
+                    }
+                if lower >= 1:
+                    lap["cts_masks"][lower] = {
+                        "mask_ext": lap["cts_masks"][lower + 1]["mask_ext"],
+                        "bbox": lap["cts_masks"][lower + 1]["bbox"],
+                        **cts[loc2id[lower]],
+                    }
+
+            lap["instances_number"] = len(lap["cts_masks"])
+
+            # print(f"Load {rtss_path.parent.name}'s {contour_name} done.")
+            # print(sorted(laps[contour_name]['cts_masks'].keys()))
+
+            lap["crop3D"] = crop3D(lap["cts_masks"],save_path=save_path,fileName=f'{rtss_path.parent.name}_{contour_name}',debug=debug)
+
     return laps
 
-
-def only_lap(
-    lapDictList: List[Dict[str, any]],
-    mode: str = ["size-preserved", "size-scaled"][0],
-    hu_cut: Optional[Tuple[int]] = (-160, 120),
-    debug: bool = False,
-):
-    hu_cut = hu_cut or (-1000, 1000)
-    lap_ary3d = np.zeros((len(lapDictList), 512, 512))
-    lapDictList = sorted(lapDictList, key=lambda x: x["loc"])
-
-    all_poly = np.concatenate([l["maskpoly"] for l in lapDictList])
-    max_x = np.max(all_poly[:, 0])
-    max_y = np.max(all_poly[:, 1])
-    min_x = np.min(all_poly[:, 0])
-    min_y = np.min(all_poly[:, 1])
-    x, y, z = max_x - min_x, max_y - min_y, len(lapDictList)
-    # print(max_x, max_y, min_x, min_y)
-    if x > 132 or y > 132 or z > 20:
-        raise IndexError("this will be droped! too big", (x, y, z))
-
-    for idx, lapDict in enumerate(lapDictList):
-        if lapDict["px"].shape != (512, 512):
-            lapDict["px"] = lapDict["px"][:512, :512]
-            lapDict["maskpx"] = lapDict["maskpx"][:512, :512]
-            if debug:
-                print(f"shape {lapDict['px'].shape} to left -> (512, 512)")
-                plt.imshow(lapDict["px"].clip(-160, 120), cmap=plt.cm.bone)
-                plt.plot(lapDict["maskpoly"][:, 0], lapDict["maskpoly"][:, 1], color="r")
-                plt.title("[:512,:512]")
-                plt.show()
-        lapDict["px"][lapDict["maskpx"] == 0] = -1000
-        lap_ary3d[idx] = lapDict["px"].clip(*hu_cut)
-        # print(lapDict["maskpoly"].shape)
-        if debug:
-            plt.imshow(lap_ary3d[idx], cmap=plt.cm.bone)
-            plt.plot((max_x, min_x, min_x, max_x, max_x), (max_y, max_y, min_y, min_y, max_y), color="y")
-            plt.show()
-
-    final_ary = None
-    if mode == "size-scaled":
-        final_ary = sk_xfmr.resize(lap_ary3d[:, min_y:max_y, min_x:max_x], (32, 32, 32), mode="constant")
-    elif mode == "size-preserved":
-
-        final_ary = np.full((20, 132, 132), hu_cut[0], dtype=int)
-        final_ary[
-            10 - z // 2 : 10 - z // 2 + z, 66 - y // 2 : 66 - y // 2 + y, 66 - x // 2 : 66 - x // 2 + x
-        ] = lap_ary3d[:, min_y:max_y, min_x:max_x]
-    if debug:
-        plt.imshow(final_ary[len(final_ary) // 2], cmap=plt.cm.bone)
-        plt.show()
-
-    return final_ary, lap_ary3d, x, y, z
-
-
-def get_all_laps(
-    rtssRoot:str='./data/rawdata/',
-    saveRoot:str='./data/laps/test/',
-    excelPath:str='~/vghtc/classification158/data/rawdata/LAP.xlsx',
-    exten:int=5,
-    mode:str=["size-preserved", "size-scaled"][0],
-):
-    os.makedirs(saveRoot, exist_ok=True)
-    nons, lnms, enes = 0, 0, 0
-
-    rtss_paths = glob.glob(os.path.join(rtssRoot, '**', 'RS.*.dcm'), recursive=True)
-    rtss_paths = sorted(rtss_paths, key=lambda x: int(re.findall(r"HNNLAP-(\d{2,3}-\d{8})", x)[0].replace("-", "")))
-    exl = ExcelDataLoader(path=excelPath, indexName="病人編號", header=0)
-    for rtss_path in rtss_paths:
-        for lap_name, lap in get_laps_from_dcm(rtss_path, exten=5).items():
-            try:
-                ary, _, x, y, z = only_lap(lap, mode=mode)
-                patient, date = re.findall(r"HNNLAP-(\d{2,3})-(\d{8})", rtss_path)[0]
-                lnm, ene = exl[int(patient), int(date), lap_name, "Path"], exl[int(patient), int(date), lap_name, "ENE"]
-                if len(lnm) == 0 or len(ene) == 0:
-                    print(f"HNNLAP-{patient}-{date}", lap_name, "not found!")
-                    continue
-                if not isinstance(lnm, str) or not isinstance(ene, str):
-                    print(f"HNNLAP-{patient}-{date}", lap_name, "more than 1 reference value")
-                    continue
-                # print(f"HNNLAP-{patient}-{date}", lap_name, f"(x, y, z) = ({x:3}, {y:3}, {z:3})", lnm, ene)
-                if lnm == "neg":
-                    np.save(os.path.join(saveRoot, f"{patient}_{date}_{lap_name}_0.npy"), ary)
-                    nons += 1
-                elif ene == "neg":
-                    np.save(os.path.join(saveRoot, f"{patient}_{date}_{lap_name}_1.npy"), ary)
-                    lnms += 1
-                elif ene == "pos":
-                    np.save(os.path.join(saveRoot, f"{patient}_{date}_{lap_name}_2.npy"), ary)
-                    enes += 1
-                else:
-                    raise ValueError(f"HNNLAP-{patient}-{date}", lap_name, "unknown status")
-            except IndexError as e:
-                print(f"HNNLAP-{patient}-{date}", lap_name, e)
-            except ValueError as e:
-                print(f"HNNLAP-{patient}-{date}", lap_name, e)
-                print(len(lnm))
-    print(f"({nons=}) + ({lnms=}) + ({enes=}) = {nons+lnms+enes}")
